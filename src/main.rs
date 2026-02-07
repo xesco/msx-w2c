@@ -131,29 +131,263 @@ fn format_time(sample_pos: usize, sample_rate: u32) -> String {
 }
 
 // =============================================================================
-// Main Decode
+// Block Decode
 // =============================================================================
 
-fn main() {
-    let cli = Cli::parse();
+fn decode_block(
+    processed: &[f64],
+    pos: usize,
+    sample_rate: u32,
+    header_freq: f64,
+    bit_config: &BitReaderConfig,
+    dec: &mut Decoder,
+    out: &mut BufWriter<File>,
+    total_bytes_written: &mut usize,
+    verbose: bool,
+    debug: bool,
+    lenient: bool,
+) -> usize {
+    let mut pos = pos;
+    let mut bit_reader = BitReader::new(sample_rate, header_freq, bit_config.clone());
+    dec.reset_for_block();
 
-    let output_path = cli.output.clone().unwrap_or_else(|| {
-        let mut p = cli.input.clone();
-        p.set_extension("cas");
-        p
-    });
+    let mut block = BlockState::new(pos);
 
-    let verbose = !cli.quiet;
+    while pos < processed.len() {
+        let sample = processed[pos];
+        pos += 1;
 
-    if verbose {
-        eprintln!("wav2cas - MSX WAV to CAS converter");
+        if let Some(decision) = bit_reader.process_sample(sample) {
+            if debug {
+                let bit_label = match decision.bit {
+                    Bit::Zero => "0",
+                    Bit::One => "1",
+                    Bit::Silence => "S",
+                };
+                eprintln!(
+                    "[{}] BIT={} p0={:.1} p1={:.1} conf={:.2}",
+                    format_time(pos, sample_rate),
+                    bit_label,
+                    decision.power_zero,
+                    decision.power_one,
+                    decision.confidence,
+                );
+            }
+
+            let action = dec.process_bit(&decision);
+
+            match action {
+                Action::DataFound => {
+                    if verbose && !block.data_found_printed {
+                        eprintln!("[{}] Data found", format_time(pos, sample_rate));
+                        block.data_found_printed = true;
+                    }
+                    block.consecutive_silences = 0;
+                }
+                Action::ByteComplete(byte) => {
+                    block.buffer.push(byte);
+                    block.consecutive_silences = 0;
+
+                    if !block.file_type_printed {
+                        if let Some((ft, name)) = dec.take_file_type() {
+                            if verbose {
+                                eprintln!(
+                                    "[{}] {} \"{}\"",
+                                    format_time(pos, sample_rate),
+                                    ft.name(),
+                                    name
+                                );
+                            }
+                            block.file_type_printed = true;
+                        }
+                    }
+
+                    if !block.binary_info_printed {
+                        if let Some(info) = dec.check_binary_info() {
+                            if verbose {
+                                eprintln!(
+                                    "[{}]   Load: 0x{:04X}, End: 0x{:04X}, Exec: 0x{:04X}",
+                                    format_time(pos, sample_rate),
+                                    info.load,
+                                    info.end,
+                                    info.exec
+                                );
+                            }
+                            if info.end >= info.load {
+                                block.expected_data_size =
+                                    Some(6 + (info.end as usize - info.load as usize + 1));
+                            }
+                            block.binary_info_printed = true;
+                        }
+                    }
+
+                    if debug && block.buffer.len() % 50 == 0 {
+                        eprintln!(
+                            "[{}] BYTE #{:04}: 0x{:02X}",
+                            format_time(pos, sample_rate),
+                            block.buffer.len(),
+                            byte
+                        );
+                    }
+                }
+                Action::SilenceDetected => {
+                    if lenient {
+                        block.consecutive_silences += 1;
+                        if block.consecutive_silences <= 3 {
+                            block.buffer.push(0x00);
+                            dec.reset_for_block();
+                            continue;
+                        }
+                    }
+
+                    flush_block(out, &mut block, total_bytes_written, pos, sample_rate, verbose);
+                    if verbose {
+                        eprintln!("[{}] Silence detected", format_time(pos, sample_rate));
+                        eprintln!();
+                    }
+                    break;
+                }
+                Action::Done => {
+                    flush_block(out, &mut block, total_bytes_written, pos, sample_rate, verbose);
+                    break;
+                }
+                Action::Continue => {
+                    block.consecutive_silences = 0;
+                }
+            }
+        }
     }
 
-    // Open WAV file
-    let reader = match WavReader::open(&cli.input) {
+    // Flush any remaining buffered bytes (block terminated by EOF)
+    if !block.buffer.is_empty() {
+        flush_block(out, &mut block, total_bytes_written, pos, sample_rate, verbose);
+    }
+
+    pos
+}
+
+// =============================================================================
+// Parameter Adaptation
+// =============================================================================
+
+fn adapt_parameters(
+    snr_db: f64,
+    detected_baud: Option<f64>,
+    pilot_quality: Option<f64>,
+    lenient: bool,
+) -> (BitReaderConfig, HeaderConfig) {
+    let snr_factor = ((snr_db - 10.0) / 20.0).clamp(0.0, 1.0);
+
+    let mut bit_config = BitReaderConfig {
+        silence_ratio: lerp(0.03, 0.01, snr_factor),
+        silence_threshold: lerp(6.0, 3.0, snr_factor).round() as usize,
+        header_end_sensitivity: lerp(0.25, 0.125, snr_factor),
+        phase_adjust_coeff: lerp(0.3, 0.5, snr_factor),
+        power_hold_ratio: lerp(0.10, 0.25, snr_factor),
+    };
+
+    let mut header_config = HeaderConfig::default();
+
+    if let Some(baud) = detected_baud {
+        header_config.min_bauds = baud * 0.9;
+        header_config.max_bauds = baud * 1.1;
+    }
+    if let Some(quality) = pilot_quality {
+        header_config.quality_threshold = quality * 0.4;
+    }
+
+    if lenient {
+        bit_config = bit_config.with_lenient();
+        header_config.quality_threshold *= 0.5;
+    }
+
+    (bit_config, header_config)
+}
+
+fn print_analysis_summary(
+    analysis: &SignalAnalysis,
+    scan_seconds: f64,
+    total_duration: f64,
+    gain: f64,
+    manual_volume: bool,
+    detected_baud: Option<f64>,
+    pilot_quality: Option<f64>,
+    bit_config: &BitReaderConfig,
+    header_config: &HeaderConfig,
+) {
+    let defaults_bit = BitReaderConfig::default();
+    let defaults_hdr = HeaderConfig::default();
+
+    let mark = |val: f64, def: f64| -> &'static str {
+        if (val - def).abs() > 1e-6 { " *" } else { "" }
+    };
+    let mark_usize = |val: usize, def: usize| -> &'static str {
+        if val != def { " *" } else { "" }
+    };
+
+    eprintln!();
+    eprintln!(
+        "Signal analysis ({:.1}s pre-scan):",
+        scan_seconds.min(total_duration)
+    );
+    eprintln!("  Peak amplitude:    {:.2}", analysis.peak_amplitude);
+    eprintln!("  Noise floor:       {:.2} (RMS)", analysis.noise_floor);
+    eprintln!(
+        "  SNR:               {:.0} dB ({})",
+        analysis.snr_db,
+        snr_quality(analysis.snr_db)
+    );
+    if manual_volume {
+        eprintln!("  Gain:              {:.1}x (manual)", gain);
+    } else {
+        eprintln!("  Gain:              {:.1}x *", gain);
+    }
+    if let Some(baud) = detected_baud {
+        eprintln!("  Detected baud:     {:.0} *", baud);
+    }
+    if let Some(quality) = pilot_quality {
+        eprintln!("  Pilot quality:     {:.1} *", quality);
+    }
+    eprintln!("  Min bauds:         {:.0}{}", header_config.min_bauds,
+        mark(header_config.min_bauds, defaults_hdr.min_bauds));
+    eprintln!("  Max bauds:         {:.0}{}", header_config.max_bauds,
+        mark(header_config.max_bauds, defaults_hdr.max_bauds));
+    eprintln!("  Quality threshold: {:.1}{}", header_config.quality_threshold,
+        mark(header_config.quality_threshold, defaults_hdr.quality_threshold));
+    eprintln!("  Silence ratio:     {:.3}{}", bit_config.silence_ratio,
+        mark(bit_config.silence_ratio, defaults_bit.silence_ratio));
+    eprintln!("  Silence tolerance: {}{}", bit_config.silence_threshold,
+        mark_usize(bit_config.silence_threshold, defaults_bit.silence_threshold));
+    eprintln!("  Header end sens:   {:.3}{}", bit_config.header_end_sensitivity,
+        mark(bit_config.header_end_sensitivity, defaults_bit.header_end_sensitivity));
+    eprintln!("  Phase adjust:      {:.2}{}", bit_config.phase_adjust_coeff,
+        mark(bit_config.phase_adjust_coeff, defaults_bit.phase_adjust_coeff));
+    eprintln!("  Power hold:        {:.2}{}", bit_config.power_hold_ratio,
+        mark(bit_config.power_hold_ratio, defaults_bit.power_hold_ratio));
+
+    let any_changed = !manual_volume
+        || detected_baud.is_some()
+        || (header_config.quality_threshold - defaults_hdr.quality_threshold).abs() > 1e-6
+        || (bit_config.silence_ratio - defaults_bit.silence_ratio).abs() > 1e-6
+        || bit_config.silence_threshold != defaults_bit.silence_threshold
+        || (bit_config.header_end_sensitivity - defaults_bit.header_end_sensitivity).abs() > 1e-6
+        || (bit_config.phase_adjust_coeff - defaults_bit.phase_adjust_coeff).abs() > 1e-6
+        || (bit_config.power_hold_ratio - defaults_bit.power_hold_ratio).abs() > 1e-6;
+    if any_changed {
+        eprintln!("  * adapted from pre-scan");
+    }
+    eprintln!();
+}
+
+// =============================================================================
+// WAV Loading
+// =============================================================================
+
+fn load_wav(path: &std::path::Path, verbose: bool) -> (Vec<f64>, u32) {
+    let reader = match WavReader::open(path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Error: Cannot open {}: {}", cli.input.display(), e);
+            eprintln!("Error: Cannot open {}: {}", path.display(), e);
             std::process::exit(1);
         }
     };
@@ -172,8 +406,7 @@ fn main() {
         );
     }
 
-    // Read all samples, convert to f64 mono [-1.0, 1.0]
-    let all_samples: Vec<f64> = match spec.sample_format {
+    let samples: Vec<f64> = match spec.sample_format {
         hound::SampleFormat::Int => {
             let max_val = (1i64 << (bits - 1)) as f64;
             let raw: Vec<i32> = reader.into_samples::<i32>().filter_map(|s| s.ok()).collect();
@@ -185,10 +418,35 @@ fn main() {
         }
     };
 
-    if all_samples.is_empty() {
+    if samples.is_empty() {
         eprintln!("Error: WAV file contains no samples");
         std::process::exit(1);
     }
+
+    (samples, sample_rate)
+}
+
+// =============================================================================
+// Main Decode
+// =============================================================================
+
+fn main() {
+    let cli = Cli::parse();
+
+    let output_path = cli.output.clone().unwrap_or_else(|| {
+        let mut p = cli.input.clone();
+        p.set_extension("cas");
+        p
+    });
+
+    let verbose = !cli.quiet;
+
+    if verbose {
+        eprintln!("wav2cas - MSX WAV to CAS converter");
+    }
+
+    // Load WAV file
+    let (all_samples, sample_rate) = load_wav(&cli.input, verbose);
 
     // Pre-scan signal analysis
     let analysis = prescan_signal(&all_samples, sample_rate, cli.scan);
@@ -215,96 +473,18 @@ fn main() {
     let pilot_quality = pilot_result.as_ref().map(|r| r.quality);
 
     // Adapt all parameters from pre-scan
-    let defaults_bit = BitReaderConfig::default();
-    let defaults_hdr = HeaderConfig::default();
-
-    // SNR quality factor: 0.0 at ≤10dB, 1.0 at ≥30dB, linear between
-    let snr_factor = ((analysis.snr_db - 10.0) / 20.0).clamp(0.0, 1.0);
-
-    let mut bit_config = BitReaderConfig {
-        silence_ratio: lerp(0.03, 0.01, snr_factor),
-        silence_threshold: lerp(6.0, 3.0, snr_factor).round() as usize,
-        header_end_sensitivity: lerp(0.25, 0.125, snr_factor),
-        phase_adjust_coeff: lerp(0.3, 0.5, snr_factor),
-        power_hold_ratio: lerp(0.10, 0.25, snr_factor),
-    };
-
-    let mut header_config = HeaderConfig::default();
-
-    // Adaptive baud range and quality threshold from pilot detection
-    if let Some(baud) = detected_baud {
-        header_config.min_bauds = baud * 0.9;
-        header_config.max_bauds = baud * 1.1;
-    }
-    if let Some(quality) = pilot_quality {
-        header_config.quality_threshold = quality * 0.4;
-    }
-
-    if cli.lenient {
-        bit_config = bit_config.with_lenient();
-        header_config.quality_threshold *= 0.5;
-    }
+    let (bit_config, header_config) = adapt_parameters(
+        analysis.snr_db, detected_baud, pilot_quality, cli.lenient,
+    );
 
     if verbose {
-        let mark = |val: f64, def: f64| -> &'static str {
-            if (val - def).abs() > 1e-6 { " *" } else { "" }
-        };
-        let mark_usize = |val: usize, def: usize| -> &'static str {
-            if val != def { " *" } else { "" }
-        };
-
-        eprintln!();
-        eprintln!(
-            "Signal analysis ({:.1}s pre-scan):",
-            cli.scan.min(all_samples.len() as f64 / sample_rate as f64)
+        let total_duration = all_samples.len() as f64 / sample_rate as f64;
+        print_analysis_summary(
+            &analysis, cli.scan, total_duration,
+            gain, cli.volume.is_some(),
+            detected_baud, pilot_quality,
+            &bit_config, &header_config,
         );
-        eprintln!("  Peak amplitude:    {:.2}", analysis.peak_amplitude);
-        eprintln!("  Noise floor:       {:.2} (RMS)", analysis.noise_floor);
-        eprintln!(
-            "  SNR:               {:.0} dB ({})",
-            analysis.snr_db,
-            snr_quality(analysis.snr_db)
-        );
-        if cli.volume.is_some() {
-            eprintln!("  Gain:              {:.1}x (manual)", gain);
-        } else {
-            eprintln!("  Gain:              {:.1}x *", gain);
-        }
-        if let Some(baud) = detected_baud {
-            eprintln!("  Detected baud:     {:.0} *", baud);
-        }
-        if let Some(quality) = pilot_quality {
-            eprintln!("  Pilot quality:     {:.1} *", quality);
-        }
-        eprintln!("  Min bauds:         {:.0}{}", header_config.min_bauds,
-            mark(header_config.min_bauds, defaults_hdr.min_bauds));
-        eprintln!("  Max bauds:         {:.0}{}", header_config.max_bauds,
-            mark(header_config.max_bauds, defaults_hdr.max_bauds));
-        eprintln!("  Quality threshold: {:.1}{}", header_config.quality_threshold,
-            mark(header_config.quality_threshold, defaults_hdr.quality_threshold));
-        eprintln!("  Silence ratio:     {:.3}{}", bit_config.silence_ratio,
-            mark(bit_config.silence_ratio, defaults_bit.silence_ratio));
-        eprintln!("  Silence tolerance: {}{}", bit_config.silence_threshold,
-            mark_usize(bit_config.silence_threshold, defaults_bit.silence_threshold));
-        eprintln!("  Header end sens:   {:.3}{}", bit_config.header_end_sensitivity,
-            mark(bit_config.header_end_sensitivity, defaults_bit.header_end_sensitivity));
-        eprintln!("  Phase adjust:      {:.2}{}", bit_config.phase_adjust_coeff,
-            mark(bit_config.phase_adjust_coeff, defaults_bit.phase_adjust_coeff));
-        eprintln!("  Power hold:        {:.2}{}", bit_config.power_hold_ratio,
-            mark(bit_config.power_hold_ratio, defaults_bit.power_hold_ratio));
-
-        let any_changed = cli.volume.is_none()
-            || detected_baud.is_some()
-            || (header_config.quality_threshold - defaults_hdr.quality_threshold).abs() > 1e-6
-            || (bit_config.silence_ratio - defaults_bit.silence_ratio).abs() > 1e-6
-            || bit_config.silence_threshold != defaults_bit.silence_threshold
-            || (bit_config.header_end_sensitivity - defaults_bit.header_end_sensitivity).abs() > 1e-6
-            || (bit_config.phase_adjust_coeff - defaults_bit.phase_adjust_coeff).abs() > 1e-6
-            || (bit_config.power_hold_ratio - defaults_bit.power_hold_ratio).abs() > 1e-6;
-        if any_changed {
-            eprintln!("  * adapted from pre-scan");
-        }
-        eprintln!();
     }
 
     // Open output file
@@ -374,184 +554,11 @@ fn main() {
         total_bytes_written += CAS_HEADER.len();
 
         // Phase 2: Bit reading + decoding
-        let mut bit_reader = BitReader::new(
-            sample_rate,
-            header_freq,
-            bit_config.clone(),
+        pos = decode_block(
+            &processed, pos, sample_rate, header_freq, &bit_config,
+            &mut dec, &mut out, &mut total_bytes_written,
+            verbose, cli.debug, cli.lenient,
         );
-        dec.reset_for_block();
-
-        let mut block_buffer: Vec<u8> = Vec::new();
-        let block_start_pos = pos;
-        let mut data_found_printed = false;
-        let mut file_type_printed = false;
-        let mut binary_info_printed = false;
-        let mut consecutive_silences = 0;
-        let mut expected_data_size: Option<usize> = None;
-
-        while pos < processed.len() {
-            let sample = processed[pos];
-            pos += 1;
-
-            if let Some(decision) = bit_reader.process_sample(sample) {
-                if cli.debug {
-                    let bit_label = match decision.bit {
-                        Bit::Zero => "0",
-                        Bit::One => "1",
-                        Bit::Silence => "S",
-                    };
-                    eprintln!(
-                        "[{}] BIT={} p0={:.1} p1={:.1} conf={:.2}",
-                        format_time(pos, sample_rate),
-                        bit_label,
-                        decision.power_zero,
-                        decision.power_one,
-                        decision.confidence,
-                    );
-                }
-
-                let action = dec.process_bit(&decision);
-
-                match action {
-                    Action::DataFound => {
-                        if verbose && !data_found_printed {
-                            eprintln!("[{}] Data found", format_time(pos, sample_rate));
-                            data_found_printed = true;
-                        }
-                        consecutive_silences = 0;
-                    }
-                    Action::ByteComplete(byte) => {
-                        block_buffer.push(byte);
-                        consecutive_silences = 0;
-
-                        // Check for file type detection
-                        if !file_type_printed {
-                            if let Some((ft, name)) = dec.take_file_type() {
-                                if verbose {
-                                    eprintln!(
-                                        "[{}] {} \"{}\"",
-                                        format_time(pos, sample_rate),
-                                        ft.name(),
-                                        name
-                                    );
-                                }
-                                file_type_printed = true;
-                            }
-                        }
-
-                        // Check for binary info to know expected block size
-                        if !binary_info_printed {
-                            if let Some(info) = dec.check_binary_info() {
-                                if verbose {
-                                    eprintln!(
-                                        "[{}]   Load: 0x{:04X}, End: 0x{:04X}, Exec: 0x{:04X}",
-                                        format_time(pos, sample_rate),
-                                        info.load,
-                                        info.end,
-                                        info.exec
-                                    );
-                                }
-                                // Expected = 6 address bytes + (end - load + 1) data bytes
-                                if info.end >= info.load {
-                                    expected_data_size =
-                                        Some(6 + (info.end as usize - info.load as usize + 1));
-                                }
-                                binary_info_printed = true;
-                            }
-                        }
-
-                        if cli.debug && block_buffer.len() % 50 == 0 {
-                            eprintln!(
-                                "[{}] BYTE #{:04}: 0x{:02X}",
-                                format_time(pos, sample_rate),
-                                block_buffer.len(),
-                                byte
-                            );
-                        }
-                    }
-                    Action::SilenceDetected => {
-                        if cli.lenient {
-                            consecutive_silences += 1;
-                            if consecutive_silences <= 3 {
-                                block_buffer.push(0x00);
-                                dec.reset_for_block();
-                                continue;
-                            }
-                        }
-
-                        // Trim trailing garbage bytes from leader zone.
-                        // For BINARY data blocks, we know the exact expected size.
-                        if let Some(expected) = expected_data_size {
-                            block_buffer.truncate(block_buffer.len().min(expected));
-                        }
-
-                        let block_bytes = write_block_buffer(&mut out, &mut block_buffer, &mut total_bytes_written);
-
-                        let elapsed_samples = pos - block_start_pos;
-                        let elapsed = elapsed_samples as f64 / sample_rate as f64;
-                        let rate = if elapsed > 0.0 {
-                            block_bytes as f64 / elapsed
-                        } else {
-                            0.0
-                        };
-                        if verbose {
-                            eprintln!(
-                                "[{}] Reading data ({} bytes) [{:.1} B/s]",
-                                format_time(pos, sample_rate),
-                                block_bytes,
-                                rate
-                            );
-                            eprintln!("[{}] Silence detected", format_time(pos, sample_rate));
-                            eprintln!();
-                        }
-                        break;
-                    }
-                    Action::Done => {
-                        let block_bytes = write_block_buffer(&mut out, &mut block_buffer, &mut total_bytes_written);
-
-                        let elapsed_samples = pos - block_start_pos;
-                        let elapsed = elapsed_samples as f64 / sample_rate as f64;
-                        let rate = if elapsed > 0.0 {
-                            block_bytes as f64 / elapsed
-                        } else {
-                            0.0
-                        };
-                        if verbose && block_bytes > 0 {
-                            eprintln!(
-                                "[{}] Reading data ({} bytes) [{:.1} B/s]",
-                                format_time(pos, sample_rate),
-                                block_bytes,
-                                rate
-                            );
-                        }
-                        break;
-                    }
-                    Action::Continue => {
-                        consecutive_silences = 0;
-                    }
-                }
-            }
-        }
-
-        // Flush any remaining buffered bytes (block terminated by EOF)
-        if !block_buffer.is_empty() {
-            let block_bytes = write_block_buffer(&mut out, &mut block_buffer, &mut total_bytes_written);
-            if verbose && block_bytes > 0 {
-                let elapsed_samples = pos - block_start_pos;
-                let elapsed = elapsed_samples as f64 / sample_rate as f64;
-                let rate = if elapsed > 0.0 {
-                    block_bytes as f64 / elapsed
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[{}] Reading data ({} bytes) [{:.1} B/s]",
-                    format_time(pos, sample_rate),
-                    block_bytes,
-                    rate
-                );
-            }
-        }
     }
 
     // Flush output
@@ -579,21 +586,64 @@ fn lerp(poor: f64, clean: f64, factor: f64) -> f64 {
     poor + (clean - poor) * factor
 }
 
-/// Write buffered block bytes to output, clear the buffer, and return bytes written.
-fn write_block_buffer(
+struct BlockState {
+    buffer: Vec<u8>,
+    start_pos: usize,
+    data_found_printed: bool,
+    file_type_printed: bool,
+    binary_info_printed: bool,
+    consecutive_silences: usize,
+    expected_data_size: Option<usize>,
+}
+
+impl BlockState {
+    fn new(start_pos: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            start_pos,
+            data_found_printed: false,
+            file_type_printed: false,
+            binary_info_printed: false,
+            consecutive_silences: 0,
+            expected_data_size: None,
+        }
+    }
+}
+
+/// Truncate buffer if expected size is known, write to output, print stats.
+/// Returns number of data bytes written.
+fn flush_block(
     out: &mut BufWriter<File>,
-    buffer: &mut Vec<u8>,
-    total: &mut usize,
+    block: &mut BlockState,
+    total_bytes_written: &mut usize,
+    pos: usize,
+    sample_rate: u32,
+    verbose: bool,
 ) -> usize {
-    let n = buffer.len();
+    if let Some(expected) = block.expected_data_size {
+        block.buffer.truncate(block.buffer.len().min(expected));
+    }
+    let n = block.buffer.len();
     if n > 0 {
-        if out.write_all(buffer).is_err() {
+        if out.write_all(&block.buffer).is_err() {
             eprintln!("Error: Failed to write data");
             std::process::exit(1);
         }
-        *total += n;
+        *total_bytes_written += n;
+
+        if verbose {
+            let elapsed_samples = pos - block.start_pos;
+            let elapsed = elapsed_samples as f64 / sample_rate as f64;
+            let rate = if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
+            eprintln!(
+                "[{}] Reading data ({} bytes) [{:.1} B/s]",
+                format_time(pos, sample_rate),
+                n,
+                rate
+            );
+        }
     }
-    buffer.clear();
+    block.buffer.clear();
     n
 }
 
