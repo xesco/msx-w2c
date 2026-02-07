@@ -1,0 +1,9 @@
+[package]
+name = "wav2cas"
+version = "0.1.0"
+edition = "2021"
+description = "MSX WAV to CAS converter with auto-adaptive signal analysis"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
